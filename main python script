@@ -1,98 +1,971 @@
+"""
+Task & Expense Manager - a command-line application
+===================================================
+Needs Python 3.6 or newer. Uses only the standard library.
+Data is saved automatically to tasks.json (Python's built-in json module).
+
+How to run:
+    python task_expense_manager.py                 (Windows: py task_expense_manager.py)
+    python task_expense_manager.py mydata.json     use a different data file
+    python task_expense_manager.py --selftest      check everything works on this computer
+
+Type 'cancel' at any prompt to abort the current action.
+
+OCR A-Level Computer Science (H446) concepts demonstrated
+---------------------------------------------------------
+Programming   modular design, decomposition, constants, dictionary dispatch,
+              exception handling (incl. a custom exception), file handling,
+              input validation (type, range, length, format, presence checks)
+Algorithms    merge sort (recursive, divide and conquer, O(n log n)),
+              binary search (O(log n)), linear search (O(n))
+Data          lists, dictionaries, tuples, a stack (undo)
+structures
+OOP           classes, encapsulation (properties), inheritance, polymorphism,
+              class methods
+Data types    money stored as integer pence to avoid floating-point
+              representation errors (0.1 + 0.2 != 0.3 in floating point)
+"""
+
 import json
 import os
+import sys
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 
-DATA_FILE = "tasks.json"
 
-def load_tasks():
-    """Load tasks from local JSON file if it exists."""
-    if not os.path.exists(DATA_FILE):
-        return []
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+def default_data_path():
+    """tasks.json next to this script. Falls back to the current folder (when
+    __file__ is unavailable, e.g. some online editors) and then the home
+    folder (when the script's folder is read-only)."""
     try:
-        with open(DATA_FILE, "r") as file:
-            return json.load(file)
-    except json.JSONDecodeError:
-        return []
+        folder = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        folder = os.getcwd()
+    if not os.access(folder, os.W_OK):
+        folder = os.path.expanduser("~")
+    return os.path.join(folder, "tasks.json")
 
-def save_tasks(tasks):
-    """Save tasks to local JSON file."""
-    with open(DATA_FILE, "w") as file:
-        json.dump(tasks, file, indent=4)
 
-def add_task(tasks):
-    """Add a new task or expense item."""
-    print("\n--- ADD NEW ENTRY ---")
-    title = input("Enter task/expense title: ").strip()
-    if not title:
-        print("Error: Title cannot be empty.\n")
-        return
-    
-    category = input("Enter category (e.g., Work, Tech, Expense): ").strip()
-    if not category:
-        category = "General"
-        
-    tasks.append({
-        "title": title,
-        "category": category,
-        "status": "Pending"
-    })
-    save_tasks(tasks)
-    print(f"✅ Success: '{title}' added under [{category}]!\n")
+DATE_FORMAT = "%d/%m/%Y"          # what the user types and sees
+ISO_FORMAT = "%Y-%m-%d"           # how dates are stored in the file
+PRIORITY_NAMES = {1: "High", 2: "Medium", 3: "Low"}
+MAX_TEXT_LENGTH = 60
+MAX_CATEGORY_LENGTH = 20
+MAX_AMOUNT_PENCE = 100000000      # GBP 1,000,000
+MIN_YEAR, MAX_YEAR = 2000, 2100
+DEFAULT_CATEGORY = "General"
+MAX_ID = 10 ** 9
 
-def view_tasks(tasks):
-    """Display all recorded tasks and expenses."""
-    if not tasks:
-        print("\n📂 No tasks or expenses recorded yet.\n")
-        return
-    
-    print("\n========================================")
-    print("          CURRENT TASKS & EXPENSES        ")
-    print("========================================")
-    for i, t in enumerate(tasks, 1):
-        status_icon = "✓" if t['status'] == "Completed" else "⏳"
-        print(f"{i}. [{status_icon}] {t['title']} — [{t['category']}] ({t['status']})")
-    print("========================================\n")
 
-def complete_task(tasks):
-    """Mark a task as completed."""
-    view_tasks(tasks)
-    if not tasks:
-        return
-    
-    try:
-        choice = int(input("Enter the number of the task to mark as complete: "))
-        if 1 <= choice <= len(tasks):
-            tasks[choice - 1]["status"] = "Completed"
-            save_tasks(tasks)
-            print(f"🎉 Task '{tasks[choice - 1]['title']}' marked as completed!\n")
+class CancelAction(Exception):
+    """Raised when the user types 'cancel' to abandon the current action."""
+
+
+# ----------------------------------------------------------------------------
+# Algorithms (written by hand so they can be studied and traced)
+# ----------------------------------------------------------------------------
+def merge_sort(items, key=lambda x: x, reverse=False):
+    """Recursive merge sort. Stable, O(n log n) time, O(n) space.
+    Returns a NEW sorted list; the original is unchanged."""
+    if len(items) <= 1:
+        return list(items)
+    middle = len(items) // 2
+    left = merge_sort(items[:middle], key, reverse)
+    right = merge_sort(items[middle:], key, reverse)
+    return merge(left, right, key, reverse)
+
+
+def merge(left, right, key, reverse):
+    """Merge two already-sorted lists into one sorted list."""
+    merged = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        a, b = key(left[i]), key(right[j])
+        take_left = (a >= b) if reverse else (a <= b)   # '=' keeps it stable
+        if take_left:
+            merged.append(left[i])
+            i += 1
         else:
-            print("❌ Invalid task number.\n")
+            merged.append(right[j])
+            j += 1
+    merged.extend(left[i:])
+    merged.extend(right[j:])
+    return merged
+
+
+def binary_search_by_id(records, target_id):
+    """Iterative binary search. Requires records sorted by ascending id.
+    Returns the index of the record, or -1 if not found. O(log n)."""
+    low, high = 0, len(records) - 1
+    while low <= high:
+        mid = (low + high) // 2
+        mid_id = records[mid].id
+        if mid_id == target_id:
+            return mid
+        if mid_id < target_id:
+            low = mid + 1
+        else:
+            high = mid - 1
+    return -1
+
+
+def linear_search(records, keyword):
+    """Case-insensitive linear search over each record's searchable text. O(n)."""
+    keyword = keyword.lower()
+    return [r for r in records if keyword in r.search_text().lower()]
+
+
+# ----------------------------------------------------------------------------
+# Formatting and parsing helpers
+# ----------------------------------------------------------------------------
+def format_money(pence):
+    """Integer pence -> '£12.50'."""
+    return "£{:,}.{:02d}".format(pence // 100, pence % 100)
+
+
+def parse_iso(text):
+    """'2026-12-25' -> date object. Raises ValueError/TypeError if invalid."""
+    return datetime.strptime(text, ISO_FORMAT).date()
+
+
+def check_iso_date(value):
+    """Validate (and normalise) a stored date. None is allowed."""
+    if value is None:
+        return None
+    return parse_iso(value).isoformat()
+
+
+def format_date(iso_string):
+    """'2026-12-25' -> '25/12/2026'. None -> '-'."""
+    if not iso_string:
+        return "-"
+    return parse_iso(iso_string).strftime(DATE_FORMAT)
+
+
+def clip(text, width):
+    """Shorten text to fit a table column."""
+    return text if len(text) <= width else text[:width - 3] + "..."
+
+
+def parse_date(text):
+    """User text 'DD/MM/YYYY' -> ISO string. Raises ValueError with a message."""
+    try:
+        parsed = datetime.strptime(text, DATE_FORMAT).date()
     except ValueError:
-        print("❌ Please enter a valid number.\n")
+        raise ValueError("Use the format DD/MM/YYYY, e.g. 25/12/2026 "
+                         "(and make it a real date).") from None
+    if not MIN_YEAR <= parsed.year <= MAX_YEAR:
+        raise ValueError("The year must be between {} and {}.".format(MIN_YEAR, MAX_YEAR))
+    return parsed.isoformat()
 
-def main():
-    tasks = load_tasks()
+
+def parse_money(text):
+    """User text such as '12.50' or '£1,200' -> integer pence.
+    Raises ValueError with a message if invalid."""
+    cleaned = text.replace("£", "").replace(",", "").strip()
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation:
+        raise ValueError("Enter an amount such as 12.50") from None
+    if not amount.is_finite():
+        raise ValueError("Enter an amount such as 12.50")
+    if amount <= 0:
+        raise ValueError("The amount must be greater than zero.")
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("Use at most 2 decimal places.")
+    if amount * 100 > MAX_AMOUNT_PENCE:
+        raise ValueError("The maximum amount is {}.".format(format_money(MAX_AMOUNT_PENCE)))
+    return int(amount * 100)
+
+
+# ----------------------------------------------------------------------------
+# OOP model: Record (base class) -> Task, Expense (subclasses)
+# ----------------------------------------------------------------------------
+class Record:
+    """Base class holding what tasks and expenses have in common."""
+
+    def __init__(self, record_id, category, created=None):
+        self._id = record_id
+        self._category = category
+        self._created = check_iso_date(created) or date.today().isoformat()
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def category(self):
+        return self._category
+
+    @property
+    def created(self):
+        return self._created
+
+    # Polymorphism: each subclass overrides these.
+    def to_dict(self):
+        raise NotImplementedError
+
+    def search_text(self):
+        raise NotImplementedError
+
+
+class Task(Record):
+    def __init__(self, record_id, title, category, priority,
+                 due_date=None, completed=False, created=None):
+        super().__init__(record_id, category, created)
+        if priority not in PRIORITY_NAMES:
+            raise ValueError("priority must be 1, 2 or 3")
+        self._title = title
+        self._priority = priority
+        self._due_date = check_iso_date(due_date)
+        self._completed = bool(completed)
+
+    @property
+    def title(self):
+        return self._title
+
+    @property
+    def priority(self):
+        return self._priority
+
+    @property
+    def due_date(self):
+        return self._due_date
+
+    @property
+    def completed(self):
+        return self._completed
+
+    def mark_complete(self):
+        self._completed = True
+
+    def reopen(self):
+        self._completed = False
+
+    def update(self, title, category, priority, due_date):
+        self._title = title
+        self._category = category
+        self._priority = priority
+        self._due_date = check_iso_date(due_date)
+
+    def is_overdue(self):
+        # ISO dates (YYYY-MM-DD) compare correctly as plain strings.
+        return (not self._completed and self._due_date is not None
+                and self._due_date < date.today().isoformat())
+
+    def search_text(self):
+        return "{} {}".format(self._title, self._category)
+
+    def to_dict(self):
+        return {"id": self._id, "title": self._title, "category": self._category,
+                "priority": self._priority, "due_date": self._due_date,
+                "completed": self._completed, "created": self._created}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(int(data["id"]), str(data["title"]), str(data["category"]),
+                   int(data["priority"]), data.get("due_date"),
+                   data.get("completed", False), data.get("created"))
+
+
+class Expense(Record):
+    def __init__(self, record_id, description, category, amount_pence,
+                 spent_on=None, created=None):
+        super().__init__(record_id, category, created)
+        if (not isinstance(amount_pence, int) or isinstance(amount_pence, bool)
+                or not 0 < amount_pence <= MAX_AMOUNT_PENCE):
+            raise ValueError("amount out of range")
+        self._description = description
+        self._amount_pence = amount_pence
+        self._spent_on = check_iso_date(spent_on) or date.today().isoformat()
+
+    @property
+    def description(self):
+        return self._description
+
+    @property
+    def amount_pence(self):
+        return self._amount_pence
+
+    @property
+    def spent_on(self):
+        return self._spent_on
+
+    def update(self, description, amount_pence, category, spent_on):
+        self._description = description
+        self._amount_pence = amount_pence
+        self._category = category
+        self._spent_on = check_iso_date(spent_on)
+
+    def search_text(self):
+        return "{} {}".format(self._description, self._category)
+
+    def to_dict(self):
+        return {"id": self._id, "description": self._description,
+                "category": self._category, "amount_pence": self._amount_pence,
+                "spent_on": self._spent_on, "created": self._created}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(int(data["id"]), str(data["description"]), str(data["category"]),
+                   data["amount_pence"], data.get("spent_on"), data.get("created"))
+
+
+# ----------------------------------------------------------------------------
+# Persistence layer
+# ----------------------------------------------------------------------------
+class DataStore:
+    """Owns all records in memory and reads/writes them to a JSON file."""
+
+    def __init__(self, path):
+        self.path = path
+        self.tasks = []             # always kept sorted by id (needed for binary search)
+        self.expenses = []          # always kept sorted by id
+        self.next_id = 1
+        self.undo_stack = []        # stack (LIFO) of ("task"|"expense", record)
+
+    def new_id(self):
+        record_id = self.next_id
+        self.next_id += 1
+        return record_id
+
+    def categories(self, kind):
+        records = self.tasks if kind == "task" else self.expenses
+        return sorted({r.category for r in records}, key=str.lower)
+
+    def load(self):
+        """Load from disk. Returns a message describing what happened."""
+        if not os.path.exists(self.path):
+            return "No data file found - starting with an empty list."
+        try:
+            with open(self.path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+            if not isinstance(raw, dict):
+                raise ValueError("top level must be an object")
+        except (ValueError, UnicodeDecodeError):     # JSONDecodeError is a ValueError
+            backup = self.path + ".corrupt"
+            try:
+                os.replace(self.path, backup)
+                return ("Data file was damaged. A copy was saved as '{}' "
+                        "and a fresh list was started.".format(backup))
+            except OSError:
+                return "Data file was damaged and could not be backed up. Starting fresh."
+        except OSError as error:
+            return "Could not read the data file ({}). Starting fresh.".format(error)
+
+        skipped = 0
+        seen_ids = set()
+        for section, cls, target in (("tasks", Task, self.tasks),
+                                     ("expenses", Expense, self.expenses)):
+            entries = raw.get(section, [])
+            if not isinstance(entries, list):
+                entries = []
+            for entry in entries:
+                try:
+                    record = cls.from_dict(entry)
+                    if record.id in seen_ids or record.id < 1:
+                        raise ValueError("duplicate or invalid id")
+                    seen_ids.add(record.id)
+                    target.append(record)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    skipped += 1
+
+        # Guarantee the lists are sorted by id so binary search is valid.
+        self.tasks = merge_sort(self.tasks, key=lambda r: r.id)
+        self.expenses = merge_sort(self.expenses, key=lambda r: r.id)
+
+        highest = max(seen_ids, default=0)
+        try:
+            stored_next = int(raw.get("next_id", 1))
+        except (TypeError, ValueError):
+            stored_next = 1
+        self.next_id = max(stored_next, highest + 1)
+
+        message = "Loaded {} task(s) and {} expense(s).".format(
+            len(self.tasks), len(self.expenses))
+        if skipped:
+            message += " ({} damaged record(s) skipped.)".format(skipped)
+        return message
+
+    def save(self):
+        """Write to a temp file then swap it in, so a crash part-way through can
+        never destroy the existing data file. Returns True on success."""
+        data = {"next_id": self.next_id,
+                "tasks": [t.to_dict() for t in self.tasks],
+                "expenses": [e.to_dict() for e in self.expenses]}
+        temp_path = self.path + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2)
+            os.replace(temp_path, self.path)
+            return True
+        except OSError as error:
+            print("  ! Could not save data: {}".format(error))
+            return False
+
+
+# ----------------------------------------------------------------------------
+# Validated input functions
+# ----------------------------------------------------------------------------
+def ask(prompt):
+    """input() wrapper that lets the user type 'cancel' to abort.
+    Pass `current` to the get_... functions below to let a blank answer mean 'keep'."""
+    text = input(prompt).strip()
+    if text.lower() == "cancel":
+        raise CancelAction
+    return text
+
+
+def get_text(prompt, max_len=MAX_TEXT_LENGTH, current=None):
+    """Non-empty text of at most max_len characters (presence + length check)."""
     while True:
-        print("========================================")
-        print("     PYTHON CLI TASK & EXPENSE MANAGER  ")
-        print("========================================")
-        print("1. View Tasks & Expenses")
-        print("2. Add New Entry")
-        print("3. Mark Task as Complete")
-        print("4. Exit")
-        
-        choice = input("Select an option (1-4): ").strip()
-        
-        if choice == "1":
-            view_tasks(tasks)
-        elif choice == "2":
-            add_task(tasks)
-        elif choice == "3":
-            complete_task(tasks)
-        elif choice == "4":
-            print("\nExiting application. Have a great day!")
-            break
+        text = " ".join(ask(prompt).split())      # tidies repeated whitespace
+        if not text:
+            if current is not None:
+                return current
+            print("  ! This cannot be empty.")
+        elif len(text) > max_len:
+            print("  ! Too long (maximum {} characters).".format(max_len))
         else:
-            print("❌ Invalid choice. Please select between 1 and 4.\n")
+            return text
+
+
+def get_int(prompt, low, high, current=None):
+    """Whole number between low and high inclusive (type + range check)."""
+    while True:
+        text = ask(prompt)
+        if not text and current is not None:
+            return current
+        try:
+            value = int(text)
+        except ValueError:
+            print("  ! Please enter a whole number.")
+            continue
+        if low <= value <= high:
+            return value
+        print("  ! Please enter a number from {} to {}.".format(low, high))
+
+
+def get_money(prompt, current=None):
+    """Valid money amount. Returns integer pence."""
+    while True:
+        text = ask(prompt)
+        if not text and current is not None:
+            return current
+        try:
+            return parse_money(text)
+        except ValueError as error:
+            print("  ! {}".format(error))
+
+
+def get_date(prompt, optional=False, default_today=False):
+    """Date typed as DD/MM/YYYY. Returns an ISO string (or None if optional and blank)."""
+    while True:
+        text = ask(prompt)
+        if not text:
+            if default_today:
+                return date.today().isoformat()
+            if optional:
+                return None
+            print("  ! A date is required.")
+            continue
+        try:
+            return parse_date(text)
+        except ValueError as error:
+            print("  ! {}".format(error))
+
+
+def get_date_or_keep(prompt, current, allow_clear=False):
+    """For editing: blank keeps the current date; 'none' removes it (if allowed)."""
+    while True:
+        text = ask(prompt)
+        if not text:
+            return current
+        if allow_clear and text.lower() == "none":
+            return None
+        try:
+            return parse_date(text)
+        except ValueError as error:
+            print("  ! {}".format(error))
+
+
+def get_category(existing, current=None):
+    """Optional category. Re-uses the spelling/case of an existing category."""
+    if existing:
+        print("  Existing categories: {}".format(", ".join(existing)))
+    default = current or DEFAULT_CATEGORY
+    label = "keep '{}'".format(default) if current else default
+    lookup = {name.lower(): name for name in existing}
+    while True:
+        text = " ".join(ask("Category (blank = {}): ".format(label)).split())
+        if not text:
+            return default
+        if len(text) > MAX_CATEGORY_LENGTH:
+            print("  ! Too long (maximum {} characters).".format(MAX_CATEGORY_LENGTH))
+            continue
+        return lookup.get(text.lower(), text[0].upper() + text[1:])
+
+
+def get_yes_no(prompt):
+    while True:
+        answer = ask(prompt + " (y/n): ").lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("  ! Please answer y or n.")
+
+
+# ----------------------------------------------------------------------------
+# Application (user interface)
+# ----------------------------------------------------------------------------
+class App:
+    def __init__(self, store):
+        self.store = store
+        self.running = True
+        # One list drives BOTH the menu display and the dispatch dictionary.
+        self.menu = [
+            ("1", "Add task", self.add_task),
+            ("2", "View tasks", self.view_tasks),
+            ("3", "Complete / reopen task", self.toggle_task),
+            ("4", "Edit task", self.edit_task),
+            ("5", "Add expense", self.add_expense),
+            ("6", "View expenses", self.view_expenses),
+            ("7", "Edit expense", self.edit_expense),
+            ("8", "Summary", self.show_summary),
+            ("9", "Search", self.search),
+            ("10", "Delete task/expense", self.delete_record),
+            ("11", "Undo last delete", self.undo_delete),
+            ("0", "Save and exit", self.quit),
+        ]
+        self.actions = {number: action for number, _, action in self.menu}
+
+    # ---- plumbing ----------------------------------------------------------
+    def run(self):
+        print("=" * 56)
+        print("          TASK & EXPENSE MANAGER")
+        print("=" * 56)
+        print("Data file: {}".format(self.store.path))
+        print(self.store.load())
+        while self.running:
+            self.show_menu()
+            try:
+                choice = ask("Choose an option: ")
+            except CancelAction:
+                continue
+            action = self.actions.get(choice)
+            if action is None:
+                print("  ! Invalid option. Please enter a number from the menu.")
+                continue
+            try:
+                action()
+            except CancelAction:
+                print("  Cancelled - nothing was changed.")
+        print("Goodbye!")
+
+    def show_menu(self):
+        print("\n" + "-" * 56)
+        half = (len(self.menu) + 1) // 2
+        left, right = self.menu[:half], self.menu[half:]
+        for row in range(half):
+            number, label, _ = left[row]
+            text = "{:>2}. {:<25}".format(number, label)
+            if row < len(right):
+                number, label, _ = right[row]
+                text += "{:>2}. {}".format(number, label)
+            print(" " + text)
+        print("-" * 56)
+
+    @staticmethod
+    def choose(title, options):
+        """Show a numbered list and return the chosen zero-based index."""
+        print(title)
+        for number, option in enumerate(options, 1):
+            print("  {}. {}".format(number, option))
+        return get_int("Choose: ", 1, len(options)) - 1
+
+    def save_and_report(self, message):
+        if self.store.save():
+            print("  " + message)
+        else:
+            print("  {} (WARNING: not saved to disk - kept in memory only.)".format(message))
+
+    @staticmethod
+    def pick_index(records, kind):
+        """Ask for an ID and binary-search for it. Returns the index, or -1."""
+        record_id = get_int("\nEnter the ID of the {}: ".format(kind), 1, MAX_ID)
+        index = binary_search_by_id(records, record_id)
+        if index == -1:
+            print("  ! There is no {} with ID {}.".format(kind, record_id))
+        return index
+
+    # ---- tasks -------------------------------------------------------------
+    def add_task(self):
+        print("\n--- Add task (type 'cancel' to abort) ---")
+        title = get_text("Title: ")
+        category = get_category(self.store.categories("task"))
+        priority = get_int("Priority (1=High, 2=Medium, 3=Low): ", 1, 3)
+        due = get_date("Due date DD/MM/YYYY (blank = none): ", optional=True)
+        task = Task(self.store.new_id(), title, category, priority, due)
+        self.store.tasks.append(task)       # ids only increase, so the list stays sorted
+        self.save_and_report("Task #{} added.".format(task.id))
+
+    def view_tasks(self):
+        print("\n--- View tasks ---")
+        if not self.store.tasks:
+            print("  No tasks yet. Add one from the menu.")
+            return
+        status = self.choose("Show which tasks?", ["All", "Pending", "Completed"])
+        sort_names = ["Priority", "Due date", "Category", "Title", "ID"]
+        sort_keys = [
+            lambda t: (t.priority, t.due_date is None, t.due_date or ""),
+            lambda t: (t.due_date is None, t.due_date or "", t.priority),
+            lambda t: (t.category.lower(), t.priority),
+            lambda t: t.title.lower(),
+            lambda t: t.id,
+        ]
+        sort_choice = self.choose("Sort by?", sort_names)
+
+        tasks = self.store.tasks
+        if status == 1:
+            tasks = [t for t in tasks if not t.completed]
+        elif status == 2:
+            tasks = [t for t in tasks if t.completed]
+        self.print_tasks(merge_sort(tasks, key=sort_keys[sort_choice]))
+
+    @staticmethod
+    def print_tasks(tasks):
+        if not tasks:
+            print("  Nothing to show.")
+            return
+        print("\n{:<5}{:<6}{:<10}{:<12}{:<15}{}".format(
+            "ID", "Done", "Priority", "Due", "Category", "Title"))
+        print("-" * 78)
+        for t in tasks:
+            done = "[x]" if t.completed else "[ ]"
+            flag = "   <-- OVERDUE" if t.is_overdue() else ""
+            print("{:<5}{:<6}{:<10}{:<12}{:<15}{}{}".format(
+                t.id, done, PRIORITY_NAMES[t.priority], format_date(t.due_date),
+                clip(t.category, 14), clip(t.title, 34), flag))
+        print("\n  {} task(s) shown.".format(len(tasks)))
+
+    def toggle_task(self):
+        print("\n--- Complete / reopen a task (type 'cancel' to abort) ---")
+        if not self.store.tasks:
+            print("  There are no tasks yet.")
+            return
+        self.print_tasks(self.store.tasks)
+        index = self.pick_index(self.store.tasks, "task")
+        if index == -1:
+            return
+        task = self.store.tasks[index]
+        if task.completed:
+            task.reopen()
+            self.save_and_report("Task #{} '{}' reopened.".format(task.id, task.title))
+        else:
+            task.mark_complete()
+            self.save_and_report("Task #{} '{}' marked complete.".format(task.id, task.title))
+
+    def edit_task(self):
+        print("\n--- Edit task (type 'cancel' to abort) ---")
+        if not self.store.tasks:
+            print("  There are no tasks yet.")
+            return
+        self.print_tasks(self.store.tasks)
+        index = self.pick_index(self.store.tasks, "task to edit")
+        if index == -1:
+            return
+        task = self.store.tasks[index]
+        print("Press Enter to keep the current value.")
+        title = get_text("Title [{}]: ".format(task.title), current=task.title)
+        category = get_category(self.store.categories("task"), current=task.category)
+        priority = get_int("Priority 1=High 2=Medium 3=Low [{}]: ".format(
+            PRIORITY_NAMES[task.priority]), 1, 3, current=task.priority)
+        due = get_date_or_keep(
+            "Due date DD/MM/YYYY [{}] (type 'none' to remove): ".format(
+                format_date(task.due_date)), task.due_date, allow_clear=True)
+        task.update(title, category, priority, due)
+        self.save_and_report("Task #{} updated.".format(task.id))
+
+    # ---- expenses ----------------------------------------------------------
+    def add_expense(self):
+        print("\n--- Add expense (type 'cancel' to abort) ---")
+        description = get_text("Description: ")
+        amount = get_money("Amount in £ (e.g. 12.50): ")
+        category = get_category(self.store.categories("expense"))
+        spent_on = get_date("Date DD/MM/YYYY (blank = today): ", default_today=True)
+        expense = Expense(self.store.new_id(), description, category, amount, spent_on)
+        self.store.expenses.append(expense)
+        self.save_and_report("Expense #{} ({}) added.".format(expense.id, format_money(amount)))
+
+    def view_expenses(self):
+        print("\n--- View expenses ---")
+        if not self.store.expenses:
+            print("  No expenses yet. Add one from the menu.")
+            return
+        sort_choice = self.choose("Sort by?", ["Newest first", "Oldest first",
+                                               "Highest amount", "Category", "ID"])
+        key_funcs = [
+            (lambda e: (e.spent_on, e.id), True),
+            (lambda e: (e.spent_on, e.id), False),
+            (lambda e: e.amount_pence, True),
+            (lambda e: (e.category.lower(), e.spent_on), False),
+            (lambda e: e.id, False),
+        ]
+        key, reverse = key_funcs[sort_choice]
+        self.print_expenses(merge_sort(self.store.expenses, key=key, reverse=reverse))
+
+    @staticmethod
+    def print_expenses(expenses):
+        if not expenses:
+            print("  Nothing to show.")
+            return
+        print("\n{:<5}{:<12}{:<15}{:>12}  {}".format(
+            "ID", "Date", "Category", "Amount", "Description"))
+        print("-" * 78)
+        total = 0
+        for e in expenses:
+            total += e.amount_pence
+            print("{:<5}{:<12}{:<15}{:>12}  {}".format(
+                e.id, format_date(e.spent_on), clip(e.category, 14),
+                format_money(e.amount_pence), clip(e.description, 34)))
+        print("-" * 78)
+        print("{:<32}{:>12}   ({} expense(s))".format("TOTAL", format_money(total), len(expenses)))
+
+    def edit_expense(self):
+        print("\n--- Edit expense (type 'cancel' to abort) ---")
+        if not self.store.expenses:
+            print("  There are no expenses yet.")
+            return
+        self.print_expenses(self.store.expenses)
+        index = self.pick_index(self.store.expenses, "expense to edit")
+        if index == -1:
+            return
+        expense = self.store.expenses[index]
+        print("Press Enter to keep the current value.")
+        description = get_text("Description [{}]: ".format(expense.description),
+                               current=expense.description)
+        amount = get_money("Amount [{}]: ".format(format_money(expense.amount_pence)),
+                           current=expense.amount_pence)
+        category = get_category(self.store.categories("expense"), current=expense.category)
+        spent_on = get_date_or_keep("Date DD/MM/YYYY [{}]: ".format(
+            format_date(expense.spent_on)), expense.spent_on)
+        expense.update(description, amount, category, spent_on)
+        self.save_and_report("Expense #{} updated.".format(expense.id))
+
+    # ---- summary & search --------------------------------------------------
+    def show_summary(self):
+        print("\n--- Summary ---")
+        tasks, expenses = self.store.tasks, self.store.expenses
+
+        print("TASKS")
+        if tasks:
+            done = sum(1 for t in tasks if t.completed)
+            overdue = sum(1 for t in tasks if t.is_overdue())
+            print("  Total: {}   Completed: {}   Pending: {}   Overdue: {}".format(
+                len(tasks), done, len(tasks) - done, overdue))
+            print("  Completion rate: {:.0f}%".format(done / len(tasks) * 100))
+        else:
+            print("  No tasks recorded.")
+
+        print("\nEXPENSES")
+        if not expenses:
+            print("  No expenses recorded.")
+            return
+        totals = {}                                     # category -> pence
+        for e in expenses:
+            totals[e.category] = totals.get(e.category, 0) + e.amount_pence
+        grand_total = sum(totals.values())
+        this_month = date.today().isoformat()[:7]       # 'YYYY-MM'
+        month_total = sum(e.amount_pence for e in expenses
+                          if e.spent_on.startswith(this_month))
+
+        print("  Total spent: {} across {} expense(s)".format(
+            format_money(grand_total), len(expenses)))
+        print("  Spent this month: {}".format(format_money(month_total)))
+        print("  Average expense: {}".format(
+            format_money(int(round(grand_total / len(expenses))))))
+        print("\n  By category:")
+        ranked = merge_sort(list(totals.items()), key=lambda pair: pair[1], reverse=True)
+        for category, pence in ranked:
+            percent = pence / grand_total * 100
+            bar = "#" * max(1, int(round(percent / 5)))
+            print("    {:<15}{:>12}  {:5.1f}%  {}".format(
+                clip(category, 14), format_money(pence), percent, bar))
+
+    def search(self):
+        print("\n--- Search (type 'cancel' to abort) ---")
+        keyword = get_text("Keyword: ")
+        task_hits = linear_search(self.store.tasks, keyword)
+        expense_hits = linear_search(self.store.expenses, keyword)
+        if not task_hits and not expense_hits:
+            print("  No matches for '{}'.".format(keyword))
+            return
+        if task_hits:
+            print("\nMatching tasks:")
+            self.print_tasks(task_hits)
+        if expense_hits:
+            print("\nMatching expenses:")
+            self.print_expenses(expense_hits)
+
+    # ---- delete / undo -----------------------------------------------------
+    def delete_record(self):
+        print("\n--- Delete (type 'cancel' to abort) ---")
+        if not self.store.tasks and not self.store.expenses:
+            print("  There is nothing to delete.")
+            return
+        if self.choose("Delete a...", ["Task", "Expense"]) == 0:
+            kind, records = "task", self.store.tasks
+            self.print_tasks(records)
+        else:
+            kind, records = "expense", self.store.expenses
+            self.print_expenses(records)
+        if not records:
+            return
+        index = self.pick_index(records, kind + " to delete")
+        if index == -1:
+            return
+        record_id = records[index].id
+        if not get_yes_no("Delete {} #{}?".format(kind, record_id)):
+            print("  Not deleted.")
+            return
+        removed = records.pop(index)
+        self.store.undo_stack.append((kind, removed))       # push onto the stack
+        self.save_and_report("{} #{} deleted. (Use option 11 to undo.)".format(
+            kind.capitalize(), record_id))
+
+    def undo_delete(self):
+        print("\n--- Undo last delete ---")
+        if not self.store.undo_stack:
+            print("  Nothing to undo.")
+            return
+        kind, record = self.store.undo_stack.pop()          # pop from the stack
+        records = self.store.tasks if kind == "task" else self.store.expenses
+        records.append(record)
+        records[:] = merge_sort(records, key=lambda r: r.id)    # restore id order
+        self.save_and_report("Restored {} #{}.".format(kind, record.id))
+
+    def quit(self):
+        if self.store.save():
+            print("  Data saved.")
+        self.running = False
+
+
+# ----------------------------------------------------------------------------
+# Self-test (python task_expense_manager.py --selftest)
+# ----------------------------------------------------------------------------
+def run_self_test():
+    """Checks the important parts work on THIS computer. Returns True if all pass."""
+    import tempfile
+    results = []
+
+    def check(name, condition):
+        results.append(bool(condition))
+        print("  [{}] {}".format("PASS" if condition else "FAIL", name))
+
+    def raises(function, *args):
+        try:
+            function(*args)
+        except ValueError:
+            return True
+        return False
+
+    print("Python {} on {}".format(sys.version.split()[0], sys.platform))
+    print("Data file would be: {}".format(default_data_path()))
+    print("Running checks...")
+
+    check("merge sort ascending", merge_sort([5, 2, 9, 1, 5, 6]) == [1, 2, 5, 5, 6, 9])
+    check("merge sort descending", merge_sort([5, 2, 9, 1, 5, 6], reverse=True) == [9, 6, 5, 5, 2, 1])
+    check("merge sort empty / single", merge_sort([]) == [] and merge_sort([3]) == [3])
+    check("merge sort leaves original alone", (lambda a: (merge_sort(a), a)[1] == [3, 1, 2])([3, 1, 2]))
+
+    sample = [Task(i, "t", "c", 1) for i in (1, 3, 4, 8, 10)]
+    found = [binary_search_by_id(sample, i) for i in (1, 3, 10, 5, 0, 11)]
+    check("binary search finds / misses correctly", found == [0, 1, 4, -1, -1, -1])
+    check("binary search on empty list", binary_search_by_id([], 1) == -1)
+
+    check("money '12.50' -> 1250p", parse_money("12.50") == 1250)
+    check("money '£1,200.50' -> 120050p", parse_money("£1,200.50") == 120050)
+    check("money rejects 0, negative, text, nan, 3dp, too big",
+          all(raises(parse_money, bad) for bad in ("0", "-5", "abc", "nan", "1.234", "99999999999", "")))
+    check("pence formatting", format_money(120050) == "£1,200.50" and format_money(5) == "£0.05")
+    check("pence addition is exact (0.1 + 0.2)", parse_money("0.10") + parse_money("0.20") == 30)
+
+    check("date '25/12/2026' accepted", parse_date("25/12/2026") == "2026-12-25")
+    check("date rejects 31/02/2026, text, empty, year 1900",
+          all(raises(parse_date, bad) for bad in ("31/02/2026", "abc", "", "01/01/1900")))
+
+    check("search is case-insensitive",
+          len(linear_search([Task(1, "Revise Paging", "Study", 1)], "paging")) == 1)
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "test.json")
+        store = DataStore(path)
+        store.tasks.append(Task(store.new_id(), "Task A", "Study", 1, "2026-12-25"))
+        store.expenses.append(Expense(store.new_id(), "Lunch", "Food", 1250, "2026-10-01"))
+        store.tasks[0].mark_complete()
+        check("save succeeds", store.save())
+        again = DataStore(path)
+        again.load()
+        check("tasks survive save/load",
+              len(again.tasks) == 1 and again.tasks[0].title == "Task A"
+              and again.tasks[0].completed and again.tasks[0].due_date == "2026-12-25")
+        check("expenses survive save/load",
+              len(again.expenses) == 1 and again.expenses[0].amount_pence == 1250)
+        check("next id preserved", again.next_id == 3)
+
+        with open(path, "w", encoding="utf-8") as file:
+            file.write("{ this is not valid json")
+        broken = DataStore(path)
+        message = broken.load()
+        check("corrupt file is backed up and recovered",
+              "damaged" in message and os.path.exists(path + ".corrupt") and broken.tasks == [])
+
+    passed = sum(results)
+    print("\n{} of {} checks passed.".format(passed, len(results)))
+    print("ALL GOOD - the program is working." if passed == len(results)
+          else "Some checks FAILED - please send me this output.")
+    return passed == len(results)
+
+
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: python task_expense_manager.py [datafile.json | --selftest]")
+        return
+    if args and args[0] == "--selftest":
+        sys.exit(0 if run_self_test() else 1)
+
+    if hasattr(sys.stdout, "reconfigure"):          # lets '£' print on any terminal
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    path = args[0] if args else default_data_path()
+    app = App(DataStore(path))
+    try:
+        app.run()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Input closed - saving and exiting.")
+        app.store.save()
+    except Exception:                               # an unexpected bug: never lose data
+        import traceback
+        traceback.print_exc()
+        app.store.save()
+        print("\nAn unexpected error happened (details above). Your data was saved.")
+        try:
+            input("Press Enter to close...")        # keeps a double-clicked window open
+        except (EOFError, KeyboardInterrupt):
+            pass
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
